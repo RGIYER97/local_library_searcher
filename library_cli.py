@@ -7,7 +7,7 @@ Flow:
   2. Parse the feed with feedparser → extract title + author per book
   3. Clean titles with regex (strip parenthetical series/edition info)
   4. Launch a Playwright browser and loop through books
-  5. For each book, run both library scrapers with random delays
+  5. For each book, run the Jersey City scraper with random delays
   6. Aggregate all results into a rich terminal table
   7. Save a plain-text copy to latest_library_run.txt
 """
@@ -16,10 +16,14 @@ import asyncio
 import os
 import random
 import re
+import ssl
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+import certifi
 import feedparser
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Browser, BrowserContext
@@ -29,7 +33,6 @@ from rich import box
 from rich.text import Text
 
 from scrapers.jc_library import check_jc_library
-from scrapers.harrison_library import check_harrison_library
 
 # ── Constants ────────────────────────────────────────────────────────────────
 OUTPUT_FILE = Path("latest_library_run.txt")
@@ -53,7 +56,8 @@ console = Console()
 # ── Step 1: Environment & Feed ───────────────────────────────────────────────
 
 def load_rss_url() -> str:
-    load_dotenv()
+    # override=True ensures .env always wins over any previously exported shell variable
+    load_dotenv(override=True)
     url = os.getenv("GOODREADS_RSS_URL", "").strip()
     if not url or "YOUR_USER_ID" in url:
         console.print(
@@ -67,6 +71,43 @@ def load_rss_url() -> str:
 
 # ── Step 2: Feed Parsing ─────────────────────────────────────────────────────
 
+_GOODREADS_UA = "library_cli/1.0 (+https://github.com/RGIYER97/local_library_searcher)"
+
+
+def _fetch_feed_bytes(url: str) -> bytes:
+    """
+    Download feed over HTTPS using certifi's CA bundle.
+
+    macOS Python installs from python.org often lack a working default CA store,
+    which causes urllib/feedparser to raise SSL: CERTIFICATE_VERIFY_FAILED.
+    """
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    req = urllib.request.Request(url, headers={"User-Agent": _GOODREADS_UA})
+    with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+        content_type = resp.headers.get("Content-Type", "")
+        raw = resp.read()
+
+    # Goodreads returns HTML when given a shelf URL instead of an RSS URL.
+    # feedparser will then fail with "not well-formed (invalid token)".
+    if "text/html" in content_type or raw.lstrip()[:15].lower().startswith(b"<!doctype"):
+        console.print(
+            "[bold red]Error:[/] The URL in your [cyan].env[/] is pointing to the Goodreads "
+            "[bold]shelf page[/] (HTML), not the [bold]RSS feed[/] (XML).\n\n"
+            "Your current URL pattern:  [yellow]/review/list/[/]\n"
+            "Required URL pattern:      [green]/review/list_rss/[/]\n\n"
+            "How to get the correct URL:\n"
+            "  1. Go to your Goodreads profile → 'Want to Read' shelf\n"
+            "  2. Scroll to the very bottom of the page\n"
+            "  3. Click the [cyan]RSS[/] icon\n"
+            "  4. Copy the URL from your browser — it will contain [green]list_rss[/]\n"
+            "  5. Paste it into [cyan].env[/] as GOODREADS_RSS_URL",
+            highlight=False,
+        )
+        sys.exit(1)
+
+    return raw
+
+
 def parse_goodreads_feed(url: str) -> list[dict]:
     """
     Fetch and parse the Goodreads RSS feed.
@@ -75,10 +116,34 @@ def parse_goodreads_feed(url: str) -> list[dict]:
     Skips entries that are missing both title and author.
     """
     console.print(f"[cyan]Fetching Goodreads feed…[/] {url}")
-    feed = feedparser.parse(url)
+    try:
+        raw = _fetch_feed_bytes(url)
+    except urllib.error.URLError as exc:
+        console.print(f"[bold red]Failed to download RSS feed:[/] {exc.reason}")
+        if "CERTIFICATE_VERIFY_FAILED" in str(exc.reason):
+            console.print(
+                "[dim]Tip: On macOS, you can also run "
+                "“Install Certificates.command” from your Python folder in Applications.[/]",
+                highlight=False,
+            )
+        sys.exit(1)
+    except OSError as exc:
+        console.print(f"[bold red]Failed to download RSS feed:[/] {exc}")
+        sys.exit(1)
+
+    feed = feedparser.parse(raw)
 
     if feed.bozo and not feed.entries:
         console.print(f"[bold red]Failed to parse RSS feed:[/] {feed.bozo_exception}")
+        sys.exit(1)
+
+    if not feed.entries and "/review/list" in url and "list_rss" not in url:
+        console.print(
+            "[bold red]No entries in feed.[/] Your URL looks like the Goodreads shelf page, "
+            "not the RSS feed. Open your shelf on Goodreads, use the [cyan]RSS[/] link at the "
+            "bottom, and copy that URL (it contains [cyan]list_rss[/]).",
+            highlight=False,
+        )
         sys.exit(1)
 
     books = []
@@ -117,58 +182,76 @@ def clean_title(title: str) -> str:
 
 # ── Step 4 & 5: Async Scraping Loop ──────────────────────────────────────────
 
+def _sanitize_status(status: str) -> str:
+    """Collapse multi-line Playwright error dumps to a single short line."""
+    # Take only the first line, cap at 60 chars
+    first_line = status.split("\n")[0].strip()
+    if first_line.lower().startswith("error:"):
+        # Strip "Error: ElementHandle.click: Timeout …" → "Timeout"
+        # Strip "Error: Page.goto: net::ERR_…"         → "Network Error"
+        inner = first_line[6:].strip()
+        if "timeout" in inner.lower():
+            return "Timeout"
+        if "net::" in inner.lower() or "err_" in inner.lower():
+            return "Network Error"
+        return first_line[:60]
+    return first_line[:60]
+
+
+def _print_jc_result(results: list[dict]) -> None:
+    """Print a per-book summary line for each JC result as it comes in."""
+    for r in results:
+        status = _sanitize_status(r.get("status", "Unknown"))
+        branch = r.get("branch", "N/A")
+        lower = status.lower()
+
+        if "available now" in lower:
+            icon = "[bold green]✓[/]"
+            detail = f"[green]{status}[/] at [bold]{branch}[/]"
+        elif "checked out" in lower or "on hold" in lower or "in transit" in lower:
+            icon = "[yellow]~[/]"
+            detail = f"[yellow]{status}[/] — [bold]{branch}[/]"
+        elif "not found" in lower:
+            icon = "[red]✗[/]"
+            detail = f"[red]Not found in physical book format[/]"
+        else:
+            icon = "[dim]?[/]"
+            detail = f"[dim]{status}[/]"
+
+        console.print(f"  {icon} JCFPL: {detail}")
+
+
 async def scrape_book(
     title: str,
     author: str,
     context: BrowserContext,
 ) -> list[dict]:
     """
-    Run both scrapers for a single book in sequence (separate pages).
-    Returns combined list of result rows.
+    Run the JC scraper for a single book.
+    Prints a live result summary to the terminal, then returns the result rows.
     """
     rows = []
-
-    # Jersey City scraper
     jc_page = await context.new_page()
     try:
         jc_results = await check_jc_library(title, author, jc_page)
         for r in jc_results:
             rows.append({**r, "title": title, "author": author})
     except Exception as exc:
-        rows.append({
-            "title": title, "author": author,
+        jc_results = [{
             "library": "Jersey City (JCFPL)", "branch": "N/A",
-            "status": f"Error: {exc}",
-        })
+            "status": _sanitize_status(f"Error: {exc}"),
+        }]
+        rows.extend({**r, "title": title, "author": author} for r in jc_results)
     finally:
         await jc_page.close()
 
-    # Polite delay between the two library systems
-    delay = random.uniform(DELAY_MIN, DELAY_MAX)
-    console.print(f"  [dim]Waiting {delay:.1f}s before Harrison search…[/]")
-    await asyncio.sleep(delay)
-
-    # Harrison scraper
-    harrison_page = await context.new_page()
-    try:
-        harrison_results = await check_harrison_library(title, author, harrison_page)
-        for r in harrison_results:
-            rows.append({**r, "title": title, "author": author})
-    except Exception as exc:
-        rows.append({
-            "title": title, "author": author,
-            "library": "Harrison, NJ", "branch": "N/A",
-            "status": f"Error: {exc}",
-        })
-    finally:
-        await harrison_page.close()
-
+    _print_jc_result(jc_results)
     return rows
 
 
 async def run_all_books(books: list[dict]) -> list[dict]:
     """
-    Iterate through the book list, calling both scrapers per book.
+    Iterate through the book list, calling the JC scraper per book.
     Inserts a random inter-book delay to avoid rate-limiting.
     """
     all_rows = []
@@ -233,7 +316,7 @@ def build_table(rows: list[dict]) -> Table:
     table.add_column("Status / When Available", min_width=22)
 
     for row in rows:
-        status = row.get("status", "Unknown")
+        status = _sanitize_status(row.get("status", "Unknown"))
         status_text = Text(status, style=_status_style(status))
 
         table.add_row(
@@ -265,7 +348,7 @@ def save_plain_text(rows: list[dict]) -> None:
             f"{row.get('author',''):<22.22} "
             f"{row.get('library',''):<20.20} "
             f"{row.get('branch',''):<22.22} "
-            f"{row.get('status','')}"
+            f"{_sanitize_status(row.get('status',''))}"
         )
 
     lines.append("=" * 90)

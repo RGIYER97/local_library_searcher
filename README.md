@@ -1,21 +1,21 @@
 # Library Availability Checker
 
-A local Python CLI tool that checks **Jersey City Free Public Library (JCFPL)** and
-**Harrison, NJ Public Library** for the availability of every book on your Goodreads
-reading list — automatically, asynchronously, and formatted as a color-coded terminal table.
+A local Python CLI tool that checks the **Jersey City Free Public Library (JCFPL)** online catalog for the availability of every book on your Goodreads reading list — formatted as a color-coded terminal table.
+
+The JCFPL catalog is **Sirsi Enterprise** ([jepl.ent.sirsi.net](https://jepl.ent.sirsi.net)).
 
 ---
 
 ## Features
 
-- **Goodreads RSS ingestion** — pulls your reading list directly from your public feed
+- **Goodreads RSS ingestion** — pulls your reading list from your public feed
 - **Automatic title cleaning** — strips series/edition markers like `(Secrets and Lies, #1)` before searching
-- **Two library catalogs** — JCFPL (BiblioCommons) and Harrison Public Library
-- **Physical books only** — filters out eBooks, Audiobooks, and eAudiobooks
-- **Availability detail** — returns branch name + "Available Now", "Checked Out (Due: …)", or hold queue depth
+- **Physical books only** — search is restricted to the Books format in the catalog
+- **Per-branch availability** — branch name plus status (including shelf-location-as-available and due dates)
 - **Rich terminal table** — color-coded status column (green / yellow / red)
 - **Plain-text file output** — saves `latest_library_run.txt` alongside the terminal view
-- **Polite delays** — random 3–6 second pauses between searches to avoid IP blocks
+- **Polite delays** — random 3–6 second pauses between book searches to reduce rate-limit risk
+- **Live progress** — prints a one-line JCFPL result for each book as it finishes
 
 ---
 
@@ -26,8 +26,7 @@ library searcher/
 ├── library_cli.py              # Main orchestrator, RSS parser, terminal UI
 ├── scrapers/
 │   ├── __init__.py
-│   ├── jc_library.py           # JCFPL (BiblioCommons) scraper
-│   └── harrison_library.py     # Harrison Public Library scraper
+│   └── jc_library.py           # JCFPL (Sirsi Enterprise) scraper
 ├── requirements.txt
 ├── .env                        # Your Goodreads RSS URL (not committed)
 ├── latest_library_run.txt      # Auto-generated after each run
@@ -59,35 +58,21 @@ pip install -r requirements.txt
 
 ### 4. Install Playwright browser binaries
 
-> **This step is mandatory.** Playwright downloads real Chromium binaries to drive
-> the catalog websites. Without it, the scrapers will crash.
+> **This step is mandatory.** Playwright downloads Chromium to drive the catalog.
 
 ```bash
 playwright install chromium
 ```
 
-If you'd like all supported browsers (not required):
-
-```bash
-playwright install
-```
-
 ### 5. Configure your Goodreads RSS URL
 
-Open `.env` and replace the placeholder value:
+Open `.env` (copy from `.env.example` if needed) and set:
 
 ```dotenv
-GOODREADS_RSS_URL=https://www.goodreads.com/review/list_rss/YOUR_USER_ID?shelf=to-read
+GOODREADS_RSS_URL=https://www.goodreads.com/review/list_rss/YOUR_USER_ID?key=...&shelf=to-read
 ```
 
-**How to find your Goodreads RSS URL:**
-1. Go to your Goodreads profile.
-2. Navigate to the shelf you want to check (e.g., "Want to Read").
-3. Scroll to the bottom of the shelf page and click the **RSS** icon.
-4. Copy the URL from your browser's address bar.
-5. Paste it into `.env`.
-
-The feed must be **public** (set in your Goodreads privacy settings).
+Use the **RSS** link at the bottom of your Goodreads shelf page — the URL must contain `list_rss`, not the normal shelf page.
 
 ---
 
@@ -97,12 +82,7 @@ The feed must be **public** (set in your Goodreads privacy settings).
 python3 library_cli.py
 ```
 
-The script will:
-1. Fetch your Goodreads feed
-2. Launch a headless Chromium browser
-3. Search both library catalogs for each book (with polite delays)
-4. Print a formatted table to your terminal
-5. Save a plain-text copy as `latest_library_run.txt`
+The script will fetch your feed, launch headless Chromium, search JCFPL for each book, print the table, and write `latest_library_run.txt`.
 
 ---
 
@@ -110,50 +90,24 @@ The script will:
 
 | Status | Color | Meaning |
 |---|---|---|
-| `Available Now` | Green | Copy is on the shelf, ready to check out |
-| `Checked Out (Due: MM/DD/YYYY)` | Yellow | All copies are checked out; due date shown |
-| `On Hold (N in queue)` | Yellow | Book has a waitlist |
-| `Not Found` | Red | No physical copy found in that library's catalog |
-| `Timeout` / `Error` | Red | Network or page-load issue during scraping |
+| `Available Now` | Green | On shelf (Sirsi often shows the shelf area name in the status column) |
+| `Checked Out (Due …)` | Yellow | Checked out; due date if the catalog exposes it |
+| `On Hold` | Yellow | Holds / waitlist |
+| `Not Found` | Red | No matching physical book in the filtered search |
+| `Timeout` | Red | Page load timed out |
 
 ---
 
 ## Troubleshooting
 
-### "Catalog Not Found — Update URL"
-The Harrison Library scraper couldn't find a search form on the library website.
-This means the catalog URL or page structure has changed.
+### SSL errors when fetching Goodreads
 
-**Fix:** Open `scrapers/harrison_library.py` and update `HARRISON_CATALOG` to the
-current catalog URL. You can find it by visiting [townofharrison.com](https://www.townofharrison.com)
-and navigating to the library section.
+The project uses `certifi` for HTTPS. Run `pip install -r requirements.txt` again. On macOS you can also run **Install Certificates.command** from the Python folder in Applications.
 
-### All books return "Not Found" for JCFPL
-The BiblioCommons catalog selectors may have changed.
+### Many books show "Not Found" but they exist on the site
 
-**Fix:** Open `scrapers/jc_library.py`. Visit [jclibrary.bibliocommons.com](https://jclibrary.bibliocommons.com),
-perform a manual search, right-click → Inspect, and update the CSS selectors in
-`check_jc_library()` and `_extract_availability()` to match the current HTML.
+The scraper targets Sirsi’s **book** facet and parses `table.detailItemTable` on the detail page. If JCFPL changes their templates, open `scrapers/jc_library.py` and adjust selectors. For debugging, set `headless=False` in `library_cli.py` so you can watch the browser.
 
-### The browser opens visibly instead of running headless
-This is normal during debugging. In `library_cli.py`, the `launch()` call uses
-`headless=True`. Change it to `headless=False` if you want to watch the scraper
-navigate the pages live — very useful for diagnosing selector issues.
+### Rate limiting
 
-### Rate limiting / IP block
-Increase `DELAY_MIN` and `DELAY_MAX` in `library_cli.py` to longer intervals
-(e.g., 8–15 seconds).
-
----
-
-## Notes on the Harrison Library Catalog
-
-Harrison Public Library is a small NJ municipal library. Their ILS (Integrated
-Library System) may be:
-
-- **Koha** (open-source, used by many small NJ libraries) — scraped first
-- **Polaris / PowerPAC** — the fallback scraper navigates the site's search form
-
-If neither approach works, set `headless=False` in `library_cli.py`, run the script,
-observe where the browser gets stuck, and update the selectors in
-`scrapers/harrison_library.py` accordingly.
+Increase `DELAY_MIN` and `DELAY_MAX` in `library_cli.py`.
