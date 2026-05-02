@@ -1,8 +1,11 @@
 # Library Availability Checker
 
-A local Python CLI tool that checks the **Jersey City Free Public Library (JCFPL)** online catalog for the availability of every book on your Goodreads reading list — formatted as a color-coded terminal table.
+A local Python CLI tool that checks two library catalogs for every book on your Goodreads reading list and prints a color-coded terminal table:
 
-The JCFPL catalog is **Sirsi Enterprise** ([jepl.ent.sirsi.net](https://jepl.ent.sirsi.net)).
+- **Jersey City Free Public Library (JCFPL)** — Sirsi Enterprise ([jepl.ent.sirsi.net](https://jepl.ent.sirsi.net))
+- **South Orange Public Library (SOPL)** — Vega Discover on the shared BCCLS catalog ([sora.search.bccls.org](https://sora.search.bccls.org))
+
+The two scrapers run in parallel per book.
 
 ---
 
@@ -10,12 +13,14 @@ The JCFPL catalog is **Sirsi Enterprise** ([jepl.ent.sirsi.net](https://jepl.ent
 
 - **Goodreads RSS ingestion** — pulls your reading list from your public feed
 - **Automatic title cleaning** — strips series/edition markers like `(Secrets and Lies, #1)` before searching
-- **Physical books only** — search is restricted to the Books format in the catalog
+- **Physical books only** — eBooks, eAudiobooks, and Audio CDs are filtered out at both libraries
 - **Per-branch availability** — branch name plus status (including shelf-location-as-available and due dates)
+- **Smart collapse + sort** — `Available Now` first; books that are checked out at every branch collapse to a single row showing the soonest return date
+- **`--available-only`** — restrict the report to books with at least one available copy
+- **Result cache** — successful per-book lookups are cached for 6 hours; `--no-cache` forces fresh scrapes
 - **Rich terminal table** — color-coded status column (green / yellow / red)
 - **Plain-text file output** — saves `latest_library_run.txt` alongside the terminal view
 - **Polite delays** — random 3–6 second pauses between book searches to reduce rate-limit risk
-- **Live progress** — prints a one-line JCFPL result for each book as it finishes
 
 ---
 
@@ -26,9 +31,11 @@ library searcher/
 ├── library_cli.py              # Main orchestrator, RSS parser, terminal UI
 ├── scrapers/
 │   ├── __init__.py
-│   └── jc_library.py           # JCFPL (Sirsi Enterprise) scraper
+│   ├── jc_library.py           # JCFPL (Sirsi Enterprise) scraper
+│   └── so_library.py           # SOPL (Vega Discover via BCCLS) scraper
 ├── requirements.txt
 ├── .env                        # Your Goodreads RSS URL (not committed)
+├── .library_cache.json         # Auto-generated 6-hour result cache
 ├── latest_library_run.txt      # Auto-generated after each run
 └── README.md
 ```
@@ -79,10 +86,12 @@ Use the **RSS** link at the bottom of your Goodreads shelf page — the URL must
 ## Running the Tool
 
 ```bash
-python3 library_cli.py
+python3 library_cli.py                       # full run, uses 6-hour cache
+python3 library_cli.py --available-only      # only show books with an available copy
+python3 library_cli.py --no-cache            # force fresh scrapes for every book
 ```
 
-The script will fetch your feed, launch headless Chromium, search JCFPL for each book, print the table, and write `latest_library_run.txt`.
+The script fetches your feed, launches headless Chromium, scrapes JCFPL and SOPL in parallel per book, prints the table, and writes `latest_library_run.txt`.
 
 ---
 
@@ -90,11 +99,18 @@ The script will fetch your feed, launch headless Chromium, search JCFPL for each
 
 | Status | Color | Meaning |
 |---|---|---|
-| `Available Now` | Green | On shelf (Sirsi often shows the shelf area name in the status column) |
-| `Checked Out (Due …)` | Yellow | Checked out; due date if the catalog exposes it |
+| `Available Now` | Green | On shelf (Sirsi often uses the shelf area name as the status) |
+| `Checked Out (Due …)` | Yellow | Checked out at one branch; due date if exposed |
+| `Checked Out — soonest: <date>` | Yellow | Every copy is checked out; row collapsed to earliest return |
 | `On Hold` | Yellow | Holds / waitlist |
-| `Not Found` | Red | No matching physical book in the filtered search |
+| `Possibly at SO — N BCCLS copies` | Yellow | SOPL only: South Orange may have it (truncated catalog list); N copies elsewhere in BCCLS are requestable |
+| `Not at SO` | Red | SOPL only: confirmed not in any BCCLS branch |
+| `Not Found` | Red | No matching physical book in the catalog |
 | `Timeout` | Red | Page load timed out |
+
+### SOPL truncation caveat
+
+The BCCLS Vega Discover API returns only the first six branches alphabetically per result, and "South Orange" usually falls outside that. When that happens we surface a `Possibly at SO — N BCCLS copies` row so you know a hold is viable even if SO availability isn't directly confirmed.
 
 ---
 
@@ -106,7 +122,9 @@ The project uses `certifi` for HTTPS. Run `pip install -r requirements.txt` agai
 
 ### Many books show "Not Found" but they exist on the site
 
-The scraper targets Sirsi’s **book** facet and parses `table.detailItemTable` on the detail page. If JCFPL changes their templates, open `scrapers/jc_library.py` and adjust selectors. For debugging, set `headless=False` in `library_cli.py` so you can watch the browser.
+JCFPL: the scraper targets Sirsi’s **book** facet and parses `table.detailItemTable` on the detail page. If JCFPL changes their templates, open `scrapers/jc_library.py` and adjust selectors.
+
+SOPL: the scraper intercepts the Vega Discover `format-groups` POST response. If BCCLS migrates off Vega Discover or the response shape changes, see `scrapers/so_library.py`. For debugging either scraper, set `headless=False` in `library_cli.py` to watch the browser.
 
 ### Rate limiting
 

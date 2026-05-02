@@ -6,13 +6,18 @@ Flow:
   1. Load Goodreads RSS URL from .env
   2. Parse the feed with feedparser → extract title + author per book
   3. Clean titles with regex (strip parenthetical series/edition info)
-  4. Launch a Playwright browser and loop through books
+  4. Launch a Playwright browser and loop through books (skipping cached results)
   5. For each book, run the Jersey City scraper with random delays
-  6. Aggregate all results into a rich terminal table
-  7. Save a plain-text copy to latest_library_run.txt
+  6. Collapse checked-out books to show soonest return; hide checked-out rows
+     when available copies exist
+  7. Sort results: Available Now → Checked Out → Not Found
+  8. Aggregate all results into a rich terminal table
+  9. Save a plain-text copy to latest_library_run.txt
 """
 
+import argparse
 import asyncio
+import json
 import os
 import random
 import re
@@ -20,7 +25,7 @@ import ssl
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import certifi
@@ -33,9 +38,13 @@ from rich import box
 from rich.text import Text
 
 from scrapers.jc_library import check_jc_library
+from scrapers.so_library import check_so_library
 
 # ── Constants ────────────────────────────────────────────────────────────────
-OUTPUT_FILE = Path("latest_library_run.txt")
+OUTPUT_FILE     = Path("latest_library_run.txt")
+CACHE_FILE      = Path(".library_cache.json")
+CACHE_VERSION   = 2          # bump when result schema changes (e.g. new library)
+CACHE_TTL_HOURS = 6
 DELAY_MIN = 3      # seconds between searches (anti-bot courtesy)
 DELAY_MAX = 6
 
@@ -51,6 +60,51 @@ STATUS_COLORS = {
 }
 
 console = Console()
+
+
+# ── Cache ─────────────────────────────────────────────────────────────────────
+
+def _cache_key(title: str, author: str) -> str:
+    return f"{title}|||{author}"
+
+
+def load_cache() -> dict:
+    """Return the cache entry dict, or {} if file is missing/corrupt/old version."""
+    if CACHE_FILE.exists():
+        try:
+            data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("version") == CACHE_VERSION:
+                entries = data.get("entries", {})
+                if isinstance(entries, dict):
+                    return entries
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_cache(cache: dict) -> None:
+    payload = {"version": CACHE_VERSION, "entries": cache}
+    CACHE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def get_cached(cache: dict, title: str, author: str) -> list[dict] | None:
+    entry = cache.get(_cache_key(title, author))
+    if not entry:
+        return None
+    try:
+        ts = datetime.fromisoformat(entry["timestamp"])
+    except (KeyError, ValueError):
+        return None
+    if datetime.now() - ts > timedelta(hours=CACHE_TTL_HOURS):
+        return None
+    return entry["results"]
+
+
+def set_cached(cache: dict, title: str, author: str, results: list[dict]) -> None:
+    cache[_cache_key(title, author)] = {
+        "timestamp": datetime.now().isoformat(),
+        "results": results,
+    }
 
 
 # ── Step 1: Environment & Feed ───────────────────────────────────────────────
@@ -180,15 +234,12 @@ def clean_title(title: str) -> str:
     return cleaned
 
 
-# ── Step 4 & 5: Async Scraping Loop ──────────────────────────────────────────
+# ── Steps 4 & 5: Async Scraping Loop ─────────────────────────────────────────
 
 def _sanitize_status(status: str) -> str:
     """Collapse multi-line Playwright error dumps to a single short line."""
-    # Take only the first line, cap at 60 chars
     first_line = status.split("\n")[0].strip()
     if first_line.lower().startswith("error:"):
-        # Strip "Error: ElementHandle.click: Timeout …" → "Timeout"
-        # Strip "Error: Page.goto: net::ERR_…"         → "Network Error"
         inner = first_line[6:].strip()
         if "timeout" in inner.lower():
             return "Timeout"
@@ -198,12 +249,12 @@ def _sanitize_status(status: str) -> str:
     return first_line[:60]
 
 
-def _print_jc_result(results: list[dict]) -> None:
-    """Print a per-book summary line for each JC result as it comes in."""
+def _print_lib_result(label: str, results: list[dict]) -> None:
+    """Print a per-book summary line for each result row as it comes in."""
     for r in results:
         status = _sanitize_status(r.get("status", "Unknown"))
         branch = r.get("branch", "N/A")
-        lower = status.lower()
+        lower  = status.lower()
 
         if "available now" in lower:
             icon = "[bold green]✓[/]"
@@ -211,14 +262,35 @@ def _print_jc_result(results: list[dict]) -> None:
         elif "checked out" in lower or "on hold" in lower or "in transit" in lower:
             icon = "[yellow]~[/]"
             detail = f"[yellow]{status}[/] — [bold]{branch}[/]"
-        elif "not found" in lower:
+        elif "possibly" in lower:
+            icon = "[yellow]?[/]"
+            detail = f"[yellow]{status}[/]"
+        elif "not found" in lower or "not at" in lower:
             icon = "[red]✗[/]"
-            detail = f"[red]Not found in physical book format[/]"
+            detail = f"[red]{status}[/]"
         else:
             icon = "[dim]?[/]"
             detail = f"[dim]{status}[/]"
 
-        console.print(f"  {icon} JCFPL: {detail}")
+        console.print(f"  {icon} {label}: {detail}")
+
+
+_LIBRARIES = [
+    ("JCFPL", "Jersey City (JCFPL)", check_jc_library),
+    ("SOPL",  "South Orange (SOPL)", check_so_library),
+]
+
+
+async def _run_one_library(checker, title, author, context, library_name):
+    """Open a fresh page, call a single library scraper, return its rows. Errors caught."""
+    page = await context.new_page()
+    try:
+        return await checker(title, author, page)
+    except Exception as exc:
+        return [{"library": library_name, "branch": "N/A",
+                 "status": _sanitize_status(f"Error: {exc}")}]
+    finally:
+        await page.close()
 
 
 async def scrape_book(
@@ -226,35 +298,43 @@ async def scrape_book(
     author: str,
     context: BrowserContext,
 ) -> list[dict]:
-    """
-    Run the JC scraper for a single book.
-    Prints a live result summary to the terminal, then returns the result rows.
-    """
-    rows = []
-    jc_page = await context.new_page()
-    try:
-        jc_results = await check_jc_library(title, author, jc_page)
-        for r in jc_results:
-            rows.append({**r, "title": title, "author": author})
-    except Exception as exc:
-        jc_results = [{
-            "library": "Jersey City (JCFPL)", "branch": "N/A",
-            "status": _sanitize_status(f"Error: {exc}"),
-        }]
-        rows.extend({**r, "title": title, "author": author} for r in jc_results)
-    finally:
-        await jc_page.close()
+    """Run all configured library scrapers concurrently for one book."""
+    tasks = [
+        _run_one_library(checker, title, author, context, lib_name)
+        for _, lib_name, checker in _LIBRARIES
+    ]
+    per_library_results = await asyncio.gather(*tasks)
 
-    _print_jc_result(jc_results)
+    rows = []
+    for (label, _, _), results in zip(_LIBRARIES, per_library_results):
+        _print_lib_result(label, results)
+        for r in results:
+            rows.append({**r, "title": title, "author": author})
     return rows
 
 
-async def run_all_books(books: list[dict]) -> list[dict]:
+async def run_all_books(books: list[dict], cache: dict) -> list[dict]:
     """
-    Iterate through the book list, calling the JC scraper per book.
-    Inserts a random inter-book delay to avoid rate-limiting.
+    Iterate through the book list, using cached results when fresh and scraping the rest.
+    Only launches a browser if at least one book needs scraping.
     """
-    all_rows = []
+    all_rows: list[dict] = []
+
+    books_to_scrape = [b for b in books if get_cached(cache, b["title"], b["author"]) is None]
+    cached_count = len(books) - len(books_to_scrape)
+    scrape_total = len(books_to_scrape)
+
+    if cached_count:
+        console.print(
+            f"[dim]{cached_count}/{len(books)} book(s) loaded from cache "
+            f"(use --no-cache to refresh).[/]\n"
+        )
+
+    if not books_to_scrape:
+        for book in books:
+            for r in get_cached(cache, book["title"], book["author"]):
+                all_rows.append({**r, "title": book["title"], "author": book["author"]})
+        return all_rows
 
     async with async_playwright() as pw:
         browser: Browser = await pw.chromium.launch(headless=True)
@@ -269,17 +349,31 @@ async def run_all_books(books: list[dict]) -> list[dict]:
         )
 
         total = len(books)
+        scrape_done = 0
         for idx, book in enumerate(books, start=1):
             title = book["title"]
             author = book["author"]
+
+            cached = get_cached(cache, title, author)
+            if cached is not None:
+                for r in cached:
+                    all_rows.append({**r, "title": title, "author": author})
+                continue
+
             console.rule(f"[bold]Book {idx}/{total}[/]")
             console.print(f"  Searching: [bold]{title}[/] by {author}")
 
             rows = await scrape_book(title, author, context)
             all_rows.extend(rows)
 
-            # Inter-book delay (skip after the last book)
-            if idx < total:
+            set_cached(cache, title, author, [
+                {"library": r["library"], "branch": r["branch"], "status": r["status"]}
+                for r in rows
+            ])
+            save_cache(cache)
+
+            scrape_done += 1
+            if scrape_done < scrape_total:
                 delay = random.uniform(DELAY_MIN, DELAY_MAX)
                 console.print(f"  [dim]Waiting {delay:.1f}s before next book…[/]")
                 await asyncio.sleep(delay)
@@ -290,7 +384,74 @@ async def run_all_books(books: list[dict]) -> list[dict]:
     return all_rows
 
 
-# ── Step 6: Rich Terminal Table ───────────────────────────────────────────────
+# ── Step 6: Collapse checked-out books ───────────────────────────────────────
+
+_DUE_DATE_RE = re.compile(r"Due\s+(\d{1,2}/\d{1,2}/\d{2,4})", re.IGNORECASE)
+
+
+def _parse_due_date(status: str):
+    m = _DUE_DATE_RE.search(status)
+    if not m:
+        return None
+    ds = m.group(1)
+    for fmt in ("%m/%d/%y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(ds, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def collapse_rows(rows: list[dict]) -> list[dict]:
+    """
+    Group rows by (title, author, library). For each group:
+    - If any copy is Available Now: show only the available rows.
+    - If all copies are Checked Out: collapse to one row with the earliest due date.
+    - Otherwise (Not Found, etc.): keep the first row.
+    Grouping per-library so each library reports its own status independently.
+    """
+    groups: dict[tuple, list[dict]] = {}
+    for row in rows:
+        key = (row.get("title", ""), row.get("author", ""), row.get("library", ""))
+        groups.setdefault(key, []).append(row)
+
+    result = []
+    for group_rows in groups.values():
+        available = [r for r in group_rows if "available now" in r.get("status", "").lower()]
+        checked_out = [r for r in group_rows if "checked out" in r.get("status", "").lower()]
+
+        if available:
+            result.extend(available)
+        elif checked_out:
+            dated = [(r, _parse_due_date(r.get("status", ""))) for r in checked_out]
+            with_dates = [(r, d) for r, d in dated if d is not None]
+            if with_dates:
+                earliest_row, earliest_date = min(with_dates, key=lambda x: x[1])
+                result.append({
+                    **earliest_row,
+                    "status": f"Checked Out — soonest: {earliest_date.strftime('%b %-d')}",
+                })
+            else:
+                result.append(checked_out[0])
+        else:
+            result.extend(group_rows[:1])
+
+    return result
+
+
+# ── Step 7: Sort ──────────────────────────────────────────────────────────────
+
+def _sort_key(row: dict) -> tuple:
+    status = row.get("status", "").lower()
+    title = row.get("title", "").lower()
+    if "available now" in status:
+        return (0, title)
+    if any(s in status for s in ("not found", "timeout", "network error", "unknown")):
+        return (2, title)
+    return (1, title)
+
+
+# ── Step 8: Rich Terminal Table ───────────────────────────────────────────────
 
 def _status_style(status: str) -> str:
     lower = status.lower()
@@ -330,7 +491,7 @@ def build_table(rows: list[dict]) -> Table:
     return table
 
 
-# ── Step 7: Plain-text file output ───────────────────────────────────────────
+# ── Step 9: Plain-text file output ───────────────────────────────────────────
 
 def save_plain_text(rows: list[dict]) -> None:
     """Write a plain-text (no ANSI) version of the results to OUTPUT_FILE."""
@@ -359,6 +520,19 @@ def save_plain_text(rows: list[dict]) -> None:
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Check library availability for your Goodreads want-to-read list."
+    )
+    parser.add_argument(
+        "--available-only", action="store_true",
+        help="Only show books with at least one available copy",
+    )
+    parser.add_argument(
+        "--no-cache", action="store_true",
+        help=f"Bypass the {CACHE_TTL_HOURS}-hour result cache and scrape everything fresh",
+    )
+    args = parser.parse_args()
+
     console.rule("[bold blue]Library Availability Checker[/]")
 
     rss_url = load_rss_url()
@@ -368,13 +542,23 @@ async def main() -> None:
         console.print("[yellow]No books found in feed. Nothing to search.[/]")
         return
 
-    all_rows = await run_all_books(books)
+    cache = {} if args.no_cache else load_cache()
+    all_rows = await run_all_books(books, cache)
+
+    processed = collapse_rows(all_rows)
+    processed.sort(key=_sort_key)
+
+    if args.available_only:
+        processed = [r for r in processed if "available now" in r.get("status", "").lower()]
+        if not processed:
+            console.print("[yellow]No books currently available.[/]")
+            return
 
     console.rule("[bold blue]Results[/]")
-    table = build_table(all_rows)
+    table = build_table(processed)
     console.print(table)
 
-    save_plain_text(all_rows)
+    save_plain_text(processed)
 
 
 if __name__ == "__main__":

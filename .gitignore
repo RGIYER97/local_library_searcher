@@ -5,4 +5,5 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 latest_library_run.txt
+.library_cache.json
 .DS_Store
