@@ -1,11 +1,8 @@
 # Library Availability Checker
 
-A local Python CLI tool that checks two library catalogs for every book on your Goodreads reading list and prints a color-coded terminal table:
+A local Python CLI tool that checks the South Orange Public Library catalog for every book on your Goodreads reading list and prints a color-coded terminal table.
 
-- **Jersey City Free Public Library (JCFPL)** — Sirsi Enterprise ([jepl.ent.sirsi.net](https://jepl.ent.sirsi.net))
-- **South Orange Public Library (SOPL)** — Vega Discover on the shared BCCLS catalog ([sora.search.bccls.org](https://sora.search.bccls.org))
-
-The two scrapers run in parallel per book.
+**South Orange Public Library (SOPL)** uses Vega Discover on the shared BCCLS catalog ([sora.search.bccls.org](https://sora.search.bccls.org)).
 
 ---
 
@@ -13,7 +10,7 @@ The two scrapers run in parallel per book.
 
 - **Goodreads RSS ingestion** — pulls your reading list from your public feed
 - **Automatic title cleaning** — strips series/edition markers like `(Secrets and Lies, #1)` before searching
-- **Physical books only** — eBooks, eAudiobooks, and Audio CDs are filtered out at both libraries
+- **Physical books only** — eBooks, eAudiobooks, and Audio CDs are filtered out
 - **Per-branch availability** — branch name plus status (including shelf-location-as-available and due dates)
 - **Smart collapse + sort** — `Available Now` first; books that are checked out at every branch collapse to a single row showing the soonest return date
 - **`--available-only`** — restrict the report to books with at least one available copy
@@ -31,8 +28,8 @@ library searcher/
 ├── library_cli.py              # Main orchestrator, RSS parser, terminal UI
 ├── scrapers/
 │   ├── __init__.py
-│   ├── jc_library.py           # JCFPL (Sirsi Enterprise) scraper
 │   └── so_library.py           # SOPL (Vega Discover via BCCLS) scraper
+├── AGENTS.md                    # Repository guidance for coding agents
 ├── requirements.txt
 ├── .env                        # Your Goodreads RSS URL (not committed)
 ├── .library_cache.json         # Auto-generated 6-hour result cache
@@ -91,7 +88,7 @@ python3 library_cli.py --available-only      # only show books with an available
 python3 library_cli.py --no-cache            # force fresh scrapes for every book
 ```
 
-The script fetches your feed, launches headless Chromium, scrapes JCFPL and SOPL in parallel per book, prints the table, and writes `latest_library_run.txt`.
+The script fetches your feed, launches headless Chromium, checks SOPL for each book, prints the table, and writes `latest_library_run.txt`.
 
 ---
 
@@ -99,7 +96,7 @@ The script fetches your feed, launches headless Chromium, scrapes JCFPL and SOPL
 
 | Status | Color | Meaning |
 |---|---|---|
-| `Available Now` | Green | On shelf (Sirsi often uses the shelf area name as the status) |
+| `Available Now` | Green | On shelf at South Orange |
 | `Checked Out (Due …)` | Yellow | Checked out at one branch; due date if exposed |
 | `Checked Out — soonest: <date>` | Yellow | Every copy is checked out; row collapsed to earliest return |
 | `On Hold` | Yellow | Holds / waitlist |
@@ -122,9 +119,7 @@ The project uses `certifi` for HTTPS. Run `pip install -r requirements.txt` agai
 
 ### Many books show "Not Found" but they exist on the site
 
-JCFPL: the scraper targets Sirsi’s **book** facet and parses `table.detailItemTable` on the detail page. If JCFPL changes their templates, open `scrapers/jc_library.py` and adjust selectors.
-
-SOPL: the scraper intercepts the Vega Discover `format-groups` POST response. If BCCLS migrates off Vega Discover or the response shape changes, see `scrapers/so_library.py`. For debugging either scraper, set `headless=False` in `library_cli.py` to watch the browser.
+The SOPL scraper intercepts the Vega Discover `format-groups` POST response. If BCCLS migrates off Vega Discover or the response shape changes, see `scrapers/so_library.py`. For debugging, set `headless=False` in `library_cli.py` to watch the browser.
 
 ### Rate limiting
 

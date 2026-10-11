@@ -7,7 +7,7 @@ Flow:
   2. Parse the feed with feedparser → extract title + author per book
   3. Clean titles with regex (strip parenthetical series/edition info)
   4. Launch a Playwright browser and loop through books (skipping cached results)
-  5. For each book, run the Jersey City scraper with random delays
+  5. For each book, run the configured library scrapers with random delays
   6. Collapse checked-out books to show soonest return; hide checked-out rows
      when available copies exist
   7. Sort results: Available Now → Checked Out → Not Found
@@ -37,13 +37,12 @@ from rich.table import Table
 from rich import box
 from rich.text import Text
 
-from scrapers.jc_library import check_jc_library
 from scrapers.so_library import check_so_library
 
 # ── Constants ────────────────────────────────────────────────────────────────
 OUTPUT_FILE     = Path("latest_library_run.txt")
 CACHE_FILE      = Path(".library_cache.json")
-CACHE_VERSION   = 2          # bump when result schema changes (e.g. new library)
+CACHE_VERSION   = 3          # bump when result schema changes (e.g. new library)
 CACHE_TTL_HOURS = 6
 DELAY_MIN = 3      # seconds between searches (anti-bot courtesy)
 DELAY_MAX = 6
@@ -276,7 +275,6 @@ def _print_lib_result(label: str, results: list[dict]) -> None:
 
 
 _LIBRARIES = [
-    ("JCFPL", "Jersey City (JCFPL)", check_jc_library),
     ("SOPL",  "South Orange (SOPL)", check_so_library),
 ]
 
